@@ -15,17 +15,38 @@ class GPTQ:
     def __init__(
         self,
         layer: nn.Linear,
-        config: GPTQConfig
+        config: GPTQConfig = NULL
     ):
         if not isinstance(layer, nn.Linear):
             print("gptq only support linear now")
 
+        self.layer = layer
+        self.dev = self.layer.weight.device
+        W = layer.weight.data.clone()
+        self.rows = W.shape[0]
+        self.columns = W.shape[1]
+        self.H = torch.zeros((self.columns, self.columns), device=self.dev)
+        self.nsamples = 0
+
     def add_batch(
         self,
-        input: torch.Tensor,
+        input: torch.Tensor,    # (b, s, d) or (s, d)
         output: torch.Tensor
     ):
-        print("-----")
+        if len(input.shape) == 2:
+            input = input.unsqueeze(0)
+        tmp = input.shape[0]
+        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
+            if len(input.shape) == 3:
+                input = input.reshape((-1, input.shape[-1]))
+            input = input.t()
+
+        self.H *= self.nsamples / (self.nsamples + tmp)
+        self.nsamples += tmp
+        # input = input.float()
+        input = math.sqrt(2 / self.nsamples) * input.float()
+        # self.H += 2 / self.nsamples * input.matmul(input.t())
+        self.H += input.matmul(input.t())
 
     def quantize(
         self
@@ -56,7 +77,7 @@ def find_layers(module: nn.Module, name: str = "", layers=[nn.Linear]) -> {str, 
     
     return res
 
-def run_gptq_for_sequenial_layers(module: nn.ModuleList, input_data: torch.Tensor, gptq_config: GPTQConfig):
+def run_gptq_for_sequenial_layers(module: nn.ModuleList, rotary_emb, input_data: torch.Tensor, gptq_config: GPTQConfig):
     gptqs: dict[str, GPTQ] = dict()
     batch_size, seq_length, hidden_size = input_data.shape
 
@@ -72,13 +93,17 @@ def run_gptq_for_sequenial_layers(module: nn.ModuleList, input_data: torch.Tenso
                         [0, 0, 0, -10000],
                         [0, 0, 0, 0]]]]
     '''
-    attention_mask = torch.ones((batch_size, seq_length))
-    attention_mask = attention_mask.reshape(batch_size, -1, -1, seq_length)
+    # attention_mask = torch.ones((batch_size, seq_length))
+    # attention_mask = attention_mask.reshape(batch_size, 1, 1, seq_length)
+    # 创建正确的attention_mask（下三角矩阵，1表示可见，0表示被mask）
+    attention_mask = torch.tril(torch.ones((batch_size, seq_length, seq_length)))
+    attention_mask = attention_mask.unsqueeze(1)  # [batch_size, 1, seq_length, seq_length]
 
-    device = input_data.device()
+    device = input_data.device
     position_ids = position_ids.to(device)
     attention_mask = attention_mask.to(device)
 
+    cur_input_tensor = [input_data[n] for n in range(batch_size)]
     for i in range(len(module)):
         # print(type(module[i]))
         decoder_layer = module[i]
@@ -102,17 +127,22 @@ def run_gptq_for_sequenial_layers(module: nn.ModuleList, input_data: torch.Tenso
             handles.append(layer.register_forward_hook(add_batch(name)))
 
         # iterate data to record stats for gptq
-        next_input_tensor = []
-        input_tensor = [input_data[0] for n in range(batch_size)]
+        # next_input_tensor = []
         for j in range(batch_size):
-            output = decoder_layer(
-                hidden_states=input_tensor[j].unsqueeze(0),
-                attention_mask=attention_mask[j:j+1],
-                position_ids=position_ids[j:j+1],
-                output_attentions=False
-            )
-            next_input_tensor.append(output)
-        input = next_input_tensor
+            with torch.no_grad():
+                cos, sin = rotary_emb(
+                    cur_input_tensor[j].unsqueeze(0), 
+                    seq_len=seq_length
+                )
+                position_embeddings = (cos, sin)
+                # output = decoder_layer(
+                #     hidden_states=cur_input_tensor[j].unsqueeze(0),
+                #     attention_mask=attention_mask[j:j+1],
+                #     position_ids=position_ids[j:j+1],
+                #     output_attentions=False
+                # )
+            # next_input_tensor.append(output[0])
+        # cur_input_tensor = next_input_tensor
 
 
 if __name__ == "__main__":
@@ -120,5 +150,5 @@ if __name__ == "__main__":
     qwen_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
     gptq_config = GPTQConfig()
     data = torch.rand((64, 16, 896))
-    run_gptq_for_sequenial_layers(qwen_model.model.layers, data, gptq_config)
+    run_gptq_for_sequenial_layers(qwen_model.model.layers, qwen_model.model.rotary_emb, data, gptq_config)
     print(qwen_model)
